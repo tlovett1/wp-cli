@@ -130,6 +130,156 @@ class Site_Command extends WP_CLI_Command {
 		WP_CLI::success( 'The site at ' . site_url() . ' was emptied.' );
 	}
 
+	public function move( $args, $assoc_args ) {
+
+		if ( empty( $assoc_args['blog_id'] ) )
+			return;
+
+		if ( empty( $assoc_args['term_id'] ) )
+			$term_id = 0;
+
+		$blog_id = (int) $assoc_args['blog_id'];
+		$term_id = (int) $assoc_args['term_id'];
+
+		WP_CLI::line( "Moving objects to " . $blog_id );
+
+		global $wpdb, $switched;
+
+		if ( $term_id > 0 ) {
+			$count_query_str =$wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->posts as posts, $wpdb->term_taxonomy as term_taxonomy, $wpdb->term_relationships as term_relationships " . 
+						 "WHERE posts.post_type = 'post' AND term_taxonomy.term_id = '%d' AND " . 
+						 "term_taxonomy.term_taxonomy_id = term_relationships.term_taxonomy_id AND " . 
+						 "term_relationships.object_id = posts.ID ", $term_id );
+			$query_str =$wpdb->prepare( "SELECT * FROM $wpdb->posts as posts, $wpdb->term_taxonomy as term_taxonomy, $wpdb->term_relationships as term_relationships " . 
+						 "WHERE posts.post_type = 'post' AND term_taxonomy.term_id = '%d' AND " . 
+						 "term_taxonomy.term_taxonomy_id = term_relationships.term_taxonomy_id AND " . 
+						 "term_relationships.object_id = posts.ID ", $term_id );
+		} else {
+			$count_query_str = "SELECT COUNT(*) FROM $wpdb->posts as posts WHERE post_type = 'post'";
+			$query_str = "SELECT * FROM $wpdb->posts as posts WHERE post_type = 'post'";
+		}
+
+		$total_posts = $wpdb->get_var( $count_query_str );
+
+		WP_CLI::line( "Total Posts: " . $total_posts );
+
+		// Break up posts into chunks
+		$chunk_size = 500;
+		$total_chunks = $total_posts / $chunk_size;
+
+		for ( $i = 0; $i < $total_chunks; $i++ ) {
+			$posts = $wpdb->get_results( $wpdb->prepare( $query_str . " LIMIT %d,%d", ( $i * $chunk_size ), $chunk_size ) );
+
+			foreach ( $posts as $post ) {
+
+				// Grab post meta for post
+				$post_metas = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM $wpdb->postmeta WHERE post_id = '%d'", $post->ID ) );
+
+				// Grab attachments
+    			$attachments = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM $wpdb->posts WHERE post_parent = '%d' AND post_type = 'attachment'", $post->ID ) );
+
+    			switch_to_blog( $blog_id );
+
+    			// Map arguments to array
+    			$post_args = array(
+    				'menu_order' => $post->menu_order,
+					'comment_status' => $post->comment_status,
+					'ping_status' => $post->ping_status,
+					'pinged' => $post->pinged,
+					'post_author' => $post->post_author, 
+					'post_content' => $post->post_content,
+					'post_date' => $post->post_date,
+					'post_date_gmt' => $post->post_date_gmt,
+					'post_excerpt' => $post->post_excerpt,
+					'post_name' => $post->post_name, // collisions?
+					'post_parent' => $post->post_parent,
+					'post_password' => $post->post_password,
+					'post_status' => $post->post_status,
+					'post_title' => $post->post_title,
+					'post_type' => $post->post_type,
+					'to_ping' => $post->to_ping,
+				);
+
+    			// Create post in new blog
+    			$new_post_id = wp_insert_post( $post_args );
+
+    			if ( empty( $new_post_id ) ) {
+    				WP_CLI::error( 'A post failed to be moved' );
+    				continue;
+    			}
+
+    			// Transfer post meta
+    			foreach ( $post_metas as $post_meta ) {
+    				update_post_meta( $new_post_id, $post_meta->meta_key, $post_meta->meta_value );
+    			}
+
+    			// Transfer attachments
+    			foreach ( $attachments as $attachment ) {
+    				// Move image to blog
+    				$new_image_url = media_sideload_image( $attachment->guid, $new_post_id );
+
+    				// Update URL's in current post
+    				$new_post_content = str_replace( $attachment->guid, $new_image_url, $post->post_content );
+    				wp_update_post(
+    					array(
+    						'ID' => $new_post_id,
+    						'post_content' => $new_post_content,
+    					)
+    				);
+    			}
+
+
+    			restore_current_blog();
+
+				// Grab comments for post
+				$post_comments = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM $wpdb->comments WHERE comment_post_ID = '%d'", $post->ID ) );
+
+				foreach ( $post_comments as $post_comment ) {
+
+					// Grab comment meta for post
+					$comment_metas = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM $wpdb->commentmeta WHERE comment_id = '%d'", $post_comments->comment_ID ) );
+
+					switch_to_blog( $blog_id );
+
+					// Map comment arguments
+					$comment_args = array(
+					    'comment_author' => $post_comment->comment_author,
+					    'comment_author_email' => $post_comment->comment_author_email,
+					    'comment_author_url' => $post_comment->comment_author_url,
+					    'comment_content' => $post_comment->comment_content,
+					    'comment_type' => $post_comment->comment_type,
+					    'comment_parent' => $post_comment->comment_parent,
+					    'user_id' => $post_comment->user_id,
+					    'comment_author_IP' => $post_comment->comment_author_IP,
+					    'comment_agent' => $post_comment->comment_agent,
+					    'comment_date' => $post_comment->comment_date,
+					    'comment_approved' => $post_comment->comment_approved,
+					);
+
+					// Insert new comment
+					$new_comment_id = wp_insert_comment( $comment_args );
+
+					if ( empty( $new_comment_id ) ) {
+	    				WP_CLI::error( 'A comment failed to be moved' );
+	    				continue;
+	    			}
+
+	    			// Transfer comment meta
+	    			foreach ( $comment_metas as $comment_meta ) {
+	    				update_post_meta( $new_comment_id, $comment_meta->meta_key, $comment_meta->meta_value );
+	    			}
+
+					restore_current_blog();
+
+				}
+			}
+		}
+
+		WP_CLI::success( 'Posts moved!' );
+
+		// Need to account for taxonomies
+	}
+
 	/**
 	 * Delete a site in a multisite install.
 	 *
